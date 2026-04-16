@@ -399,10 +399,8 @@ async def fetch_timepad_events(
         "access_statuses": ["public"],
         "starts_at_min": datetime.now(timezone.utc).isoformat(),
     }
-    if city:
-        params["cities"] = [city]
-    if category_id is not None:
-        params["category_ids"] = [category_id]
+  
+   
 
     try:
         async with session.get(

@@ -48,7 +48,6 @@ HTTP_TIMEOUT = max(3, int(os.getenv("HTTP_TIMEOUT", "10")))
 DB_PATH = Path(os.getenv("DB_PATH", "data/eventradar.db"))
 
 
-# Фолбэк-категории — если API категорий временно не ответит
 CATEGORY_FALLBACK = [
     {"id": None, "name": "Концерты"},
     {"id": None, "name": "Искусство и культура"},
@@ -80,7 +79,7 @@ GLOBAL_AIO_SESSION: aiohttp.ClientSession | None = None
 
 
 # =========================
-# База данных (SQLite для простого деплоя)
+# База данных
 # =========================
 class Database:
     def __init__(self, path: Path):
@@ -183,7 +182,7 @@ async def notify_admins(text: str) -> None:
         return
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(admin_id, text)
+            await bot.send_message(admin_id, text[:3500])
         except Exception:
             logger.exception("Не удалось отправить уведомление админу %s", admin_id)
 
@@ -247,6 +246,7 @@ class EventItem:
     address: str
     categories: list[str]
     location_obj: dict[str, Any]
+    city: str
 
 
 def normalize_datetime(value: str | None) -> str:
@@ -271,7 +271,7 @@ def build_map_link(event: EventItem, city: str | None) -> str:
             pass
     if event.address and event.address != "Не указано":
         return f"https://yandex.ru/maps/?text={quote_plus(event.address)}"
-    fallback = quote_plus(f"{event.name} {city or ''}".strip())
+    fallback = quote_plus(f"{event.name} {city or event.city or ''}".strip())
     return f"https://yandex.ru/maps/?text={fallback}"
 
 
@@ -314,24 +314,23 @@ def categories_keyboard(categories: list[dict[str, Any]]) -> InlineKeyboardMarku
 # Timepad API
 # =========================
 async def fetch_categories_from_api(max_events: int = 200) -> list[dict[str, Any]]:
-    """
-    Пытаемся взять категории из /v1/categories.
-    Если endpoint не ответит — собираем категории из списка ближайших событий.
-    """
     session = await create_aio_session()
     headers = timepad_headers()
 
     try:
-        async with session.get("https://api.timepad.ru/v1/categories", headers=headers) as resp:
+        async with session.get(
+            "https://api.timepad.ru/v1/dictionary/event_categories",
+            headers=headers,
+        ) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                values = data.get("values") if isinstance(data, dict) else data
+                values = data.get("values", [])
                 categories: list[dict[str, Any]] = []
                 if isinstance(values, list):
                     for item in values:
                         if not isinstance(item, dict):
                             continue
-                        name = item.get("name") or item.get("title")
+                        name = item.get("name")
                         category_id = item.get("id")
                         if name:
                             categories.append({"id": category_id, "name": str(name)})
@@ -339,18 +338,20 @@ async def fetch_categories_from_api(max_events: int = 200) -> list[dict[str, Any
                     categories.sort(key=lambda x: x["name"].lower())
                     return categories
     except Exception:
-        logger.warning("Не удалось получить категории из /v1/categories, включаю fallback")
+        logger.warning("Не удалось получить категории из словаря Timepad")
 
     categories_map: dict[str, dict[str, Any]] = {}
     skip = 0
     per_page = 100
+
     while skip < max_events:
         params: dict[str, Any] = {
             "limit": per_page,
             "skip": skip,
-            "fields": ["category"],
+            "fields": ["categories"],
             "sort": "+starts_at",
             "starts_at_min": datetime.now(timezone.utc).isoformat(),
+            "access_statuses": ["public"],
         }
         try:
             async with session.get(
@@ -362,15 +363,17 @@ async def fetch_categories_from_api(max_events: int = 200) -> list[dict[str, Any
                 values = data.get("values", [])
                 if not values:
                     break
+
                 for item in values:
-                    category = item.get("category") or {}
-                    if isinstance(category, dict):
-                        name = category.get("name")
-                        category_id = category.get("id")
-                        if name:
-                            categories_map[name] = {"id": category_id, "name": name}
-                    elif isinstance(category, str):
-                        categories_map[category] = {"id": None, "name": category}
+                    raw_categories = item.get("categories") or []
+                    if isinstance(raw_categories, list):
+                        for cat in raw_categories:
+                            if isinstance(cat, dict):
+                                name = cat.get("name")
+                                category_id = cat.get("id")
+                                if name:
+                                    categories_map[name] = {"id": category_id, "name": name}
+
                 skip += len(values)
         except Exception:
             logger.exception("Ошибка при fallback-сборе категорий")
@@ -380,6 +383,7 @@ async def fetch_categories_from_api(max_events: int = 200) -> list[dict[str, Any
         categories = list(categories_map.values())
         categories.sort(key=lambda x: x["name"].lower())
         return categories
+
     return CATEGORY_FALLBACK.copy()
 
 
@@ -391,16 +395,15 @@ async def fetch_timepad_events(
 ) -> list[EventItem]:
     session = await create_aio_session()
     headers = timepad_headers()
+
     params: dict[str, Any] = {
-        "limit": min(limit, 100),
+        "limit": 100,
         "skip": 0,
-        "fields": ["location", "category"],
+        "fields": ["location", "categories"],
         "sort": "+starts_at",
         "access_statuses": ["public"],
         "starts_at_min": datetime.now(timezone.utc).isoformat(),
     }
-  
-   
 
     try:
         async with session.get(
@@ -416,15 +419,36 @@ async def fetch_timepad_events(
         return []
 
     events: list[EventItem] = []
+    city_lower = city.lower() if city else None
+    category_lower = category_name.lower() if category_name else None
+
     for item in data.get("values", []):
         location = item.get("location") or {}
-        category = item.get("category") or {}
+        raw_categories = item.get("categories") or []
+
         categories: list[str] = []
-        if isinstance(category, dict):
-            if category.get("name"):
-                categories.append(str(category["name"]))
-        elif isinstance(category, str):
-            categories.append(category)
+        if isinstance(raw_categories, list):
+            for cat in raw_categories:
+                if isinstance(cat, dict) and cat.get("name"):
+                    categories.append(str(cat["name"]))
+                elif isinstance(cat, str):
+                    categories.append(cat)
+
+        event_city = str(
+            location.get("city")
+            or location.get("city_name")
+            or item.get("city")
+            or ""
+        ).strip()
+
+        if city_lower and event_city and event_city.lower() != city_lower:
+            continue
+
+        if category_lower and categories:
+            if not any(category_lower in cat.lower() for cat in categories):
+                continue
+        elif category_lower and not categories:
+            continue
 
         events.append(
             EventItem(
@@ -434,26 +458,12 @@ async def fetch_timepad_events(
                 address=str(location.get("address") or "Не указано"),
                 categories=categories,
                 location_obj=location,
+                city=event_city,
             )
         )
 
-    # Если категория по id ничего не дала, пытаемся фильтровать локально по имени.
-    if not events and category_name:
-        fallback_events = await fetch_timepad_events(city=city, limit=max(limit * 4, 50))
-        filtered = [
-            event
-            for event in fallback_events
-            if any(category_name.lower() in cat.lower() for cat in event.categories)
-        ]
-        return filtered[:limit]
-
-    if category_name:
-        local_filtered = [
-            event
-            for event in events
-            if any(category_name.lower() in cat.lower() for cat in event.categories)
-        ]
-        return (local_filtered or events)[:limit]
+        if len(events) >= limit:
+            break
 
     return events[:limit]
 
@@ -486,7 +496,7 @@ async def send_events(
         date = html.escape(event.date)
         shown_type = selected_category or (event.categories[0] if event.categories else None)
         shown_type = html.escape(shown_type) if shown_type else None
-        shown_city = html.escape(city) if city else None
+        shown_city = html.escape(city or event.city) if (city or event.city) else None
 
         map_link = html.escape(build_map_link(event, city), quote=True)
         event_url = html.escape(event.url, quote=True)
@@ -506,7 +516,7 @@ async def send_events(
         try:
             await DB.execute(
                 "INSERT INTO history (user_id, event_name, event_date, city) VALUES (?, ?, ?, ?)",
-                (message.chat.id, event.name, event.date, city),
+                (message.chat.id, event.name, event.date, city or event.city),
             )
         except Exception:
             logger.exception("Не удалось сохранить событие в историю")
@@ -785,7 +795,6 @@ async def main() -> None:
     sys.excepthook = custom_excepthook
 
     try:
-        # В aiogram 3 для пропуска накопленных апдейтов рекомендуется delete_webhook
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     finally:

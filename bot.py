@@ -26,9 +26,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-# =========================
-# Конфигурация
-# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TIMEPAD_TOKEN = os.getenv("TIMEPAD_TOKEN", "").strip()
 ADMIN_IDS = [
@@ -78,9 +75,6 @@ CACHED_CATEGORIES: list[dict[str, Any]] = []
 GLOBAL_AIO_SESSION: aiohttp.ClientSession | None = None
 
 
-# =========================
-# База данных
-# =========================
 class Database:
     def __init__(self, path: Path):
         self.path = path
@@ -149,9 +143,6 @@ class Database:
 DB = Database(DB_PATH)
 
 
-# =========================
-# Утилиты
-# =========================
 def timepad_headers() -> dict[str, str]:
     headers = {"Accept": "application/json"}
     if TIMEPAD_TOKEN:
@@ -310,9 +301,6 @@ def categories_keyboard(categories: list[dict[str, Any]]) -> InlineKeyboardMarku
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# =========================
-# Timepad API
-# =========================
 async def fetch_categories_from_api(max_events: int = 200) -> list[dict[str, Any]]:
     session = await create_aio_session()
     headers = timepad_headers()
@@ -405,6 +393,8 @@ async def fetch_timepad_events(
         "starts_at_min": datetime.now(timezone.utc).isoformat(),
     }
 
+    # Публичный endpoint /v1/events может работать без токена.
+    # Если токен пустой, Authorization не отправляется.
     try:
         async with session.get(
             "https://api.timepad.ru/v1/events", headers=headers, params=params
@@ -419,7 +409,6 @@ async def fetch_timepad_events(
         return []
 
     events: list[EventItem] = []
-    city_lower = city.lower() if city else None
     category_lower = category_name.lower() if category_name else None
 
     for item in data.get("values", []):
@@ -434,19 +423,17 @@ async def fetch_timepad_events(
                 elif isinstance(cat, str):
                     categories.append(cat)
 
+        if category_lower and categories:
+            if not any(category_lower in cat.lower() for cat in categories):
+                continue
+
         event_city = str(
             location.get("city")
             or location.get("city_name")
             or item.get("city")
+            or city
             or ""
         ).strip()
-
-       # не фильтруем строго по городу
-
-       # мягкая фильтрация по категории
-if category_lower:
-    if categories and not any(category_lower in cat.lower() for cat in categories):
-        continue
 
         events.append(
             EventItem(
@@ -463,7 +450,7 @@ if category_lower:
         if len(events) >= limit:
             break
 
-    return events[:limit]
+    return events
 
 
 async def send_events(
@@ -541,9 +528,6 @@ async def ensure_user(user_id: int, username: str | None) -> None:
         )
 
 
-# =========================
-# Хендлеры
-# =========================
 @dp.message(Command("start"))
 async def start(message: types.Message) -> None:
     await ensure_user(message.from_user.id, message.from_user.username)
@@ -758,9 +742,6 @@ async def cancel_broadcast(callback: types.CallbackQuery) -> None:
     )
 
 
-# =========================
-# Запуск
-# =========================
 def handle_loop_exception(loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
     exc = context.get("exception")
     msg = context.get("message")

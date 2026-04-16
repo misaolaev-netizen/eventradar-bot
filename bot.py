@@ -441,14 +441,12 @@ async def fetch_timepad_events(
             or ""
         ).strip()
 
-        if city_lower and event_city and event_city.lower() != city_lower:
-            continue
+       # не фильтруем строго по городу
 
-        if category_lower and categories:
-            if not any(category_lower in cat.lower() for cat in categories):
-                continue
-        elif category_lower and not categories:
-            continue
+       # мягкая фильтрация по категории
+if category_lower:
+    if categories and not any(category_lower in cat.lower() for cat in categories):
+        continue
 
         events.append(
             EventItem(
